@@ -185,7 +185,8 @@ def update_dashboard(n):
                 showgrid=True,
                 gridcolor='rgba(189, 195, 199, 0.2)',
                 title='Price (USD)',
-                tickformat='$,.2f'
+                tickformat='$,.2f',
+                range=[90000, 100000]
             ),
             hovermode='x unified',
             showlegend=False
