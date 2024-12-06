@@ -3,7 +3,7 @@ from bs4 import BeautifulSoup
 import json
 import time
 from datetime import datetime
-from confluent_kafka import Producer
+import boto3
 import logging
 import os
 import sys
@@ -27,13 +27,10 @@ def delivery_report(err, msg):
         logger.debug(f'Message delivered to {msg.topic()} [{msg.partition()}]')
 
 class BitcoinScraper:
-    def __init__(self, bootstrap_servers='localhost:9092'):
-        # Configure Confluent Kafka Producer
-        conf = {
-            'bootstrap.servers': bootstrap_servers,
-            'client.id': 'bitcoin_scraper'
-        }
-        self.producer = Producer(conf)
+    def __init__(self, stream_name='stock-data-stream', region='us-west-2'):
+        # Initialize AWS Kinesis client
+        self.kinesis_client = boto3.client('kinesis', region_name=region)
+        self.stream_name = stream_name
         self.url = "https://finance.yahoo.com/quote/BTC-USD/"
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
@@ -83,22 +80,16 @@ class BitcoinScraper:
             logger.error(f"Unexpected error: {e}")
             return None
 
-    def send_to_kafka(self, data):
+    def send_to_kinesis(self, data):
         try:
-            if data:
-                # Convert data to JSON string
-                message = json.dumps(data)
-                # Produce message to Kafka topic
-                self.producer.produce(
-                    'stock_data',
-                    value=message.encode('utf-8'),
-                    callback=delivery_report
-                )
-                # Trigger any available delivery report callbacks
-                self.producer.poll(0)
-                logger.info(f"Sent to Kafka - Bitcoin Price: ${data['price']:,.2f}")
+            response = self.kinesis_client.put_record(
+                StreamName=self.stream_name,
+                Data=json.dumps(data),
+                PartitionKey=data['symbol']
+            )
+            logger.info(f"Data sent to Kinesis. Sequence number: {response['SequenceNumber']}")
         except Exception as e:
-            logger.error(f"Error sending to Kafka: {e}")
+            logger.error(f"Error sending data to Kinesis: {str(e)}")
 
     def save_to_db(self, data):
         """Save price data to DynamoDB"""
@@ -116,8 +107,8 @@ class BitcoinScraper:
                 bitcoin_data = self.get_bitcoin_price()
                 
                 if bitcoin_data:
-                    # Send to Kafka
-                    self.send_to_kafka(bitcoin_data)
+                    # Send to Kinesis
+                    self.send_to_kinesis(bitcoin_data)
                     
                     # Save to DynamoDB
                     self.save_to_db(bitcoin_data)
@@ -131,8 +122,6 @@ class BitcoinScraper:
                 else:
                     logger.warning("Failed to retrieve Bitcoin price")
                 
-                # Flush producer queue
-                self.producer.flush()
                 time.sleep(interval_seconds)
                 
             except KeyboardInterrupt:

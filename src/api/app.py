@@ -1,5 +1,5 @@
-from flask import Flask, jsonify
-from confluent_kafka import Consumer, KafkaError
+from flask import Flask, jsonify, request
+import boto3
 import json
 import logging
 from threading import Thread
@@ -7,6 +7,7 @@ import queue
 from datetime import datetime, timedelta
 import os
 import sys
+import time
 
 # Add the project root directory to Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -15,7 +16,7 @@ from src.db.dynamodb_manager import DynamoDBManager
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -28,57 +29,67 @@ db_manager = DynamoDBManager()
 # In-memory cache for latest stock data
 latest_stocks = queue.Queue(maxsize=100)
 
-class KafkaListener(Thread):
-    def __init__(self, topic='processed_stock_data', bootstrap_servers=['localhost:9092']):
+class KinesisListener(Thread):
+    def __init__(self, stream_name='stock-data-stream', region='us-west-2'):
         Thread.__init__(self)
-        self.topic = topic
-        self.bootstrap_servers = bootstrap_servers
+        self.stream_name = stream_name
+        self.region = region
         self.daemon = True  # Thread will exit when main program exits
         
     def run(self):
         try:
-            # Configure the Confluent Kafka consumer
-            conf = {
-                'bootstrap.servers': self.bootstrap_servers[0],
-                'group.id': 'stock_api_group',
-                'auto.offset.reset': 'latest'
-            }
+            # Initialize Kinesis client
+            kinesis_client = boto3.client('kinesis', region_name=self.region)
             
-            consumer = Consumer(conf)
-            consumer.subscribe([self.topic])
+            # Get shard iterator
+            response = kinesis_client.describe_stream(StreamName=self.stream_name)
+            shard_id = response['StreamDescription']['Shards'][0]['ShardId']
             
-            logger.info(f"Started listening to Kafka topic: {self.topic}")
+            iterator_response = kinesis_client.get_shard_iterator(
+                StreamName=self.stream_name,
+                ShardId=shard_id,
+                ShardIteratorType='LATEST'
+            )
+            shard_iterator = iterator_response['ShardIterator']
+            
+            logger.info(f"Started listening to Kinesis stream: {self.stream_name}")
             
             while True:
-                msg = consumer.poll(1.0)
-                
-                if msg is None:
-                    continue
-                if msg.error():
-                    if msg.error().code() == KafkaError._PARTITION_EOF:
-                        logger.info('Reached end of partition')
-                    else:
-                        logger.error(f'Error: {msg.error()}')
-                else:
-                    try:
-                        # Decode and parse the message
-                        value = msg.value().decode('utf-8')
-                        data = json.loads(value)
-                        
-                        # Update the latest stocks queue
-                        if latest_stocks.full():
-                            latest_stocks.get()  # Remove oldest item if queue is full
-                        latest_stocks.put(data)
-                        
-                        # Save data to DynamoDB
-                        db_manager.save_price(data)
-                    except Exception as e:
-                        logger.error(f"Error processing message: {e}")
-                        
+                try:
+                    # Get records from the shard
+                    response = kinesis_client.get_records(
+                        ShardIterator=shard_iterator,
+                        Limit=100
+                    )
+                    
+                    # Process records
+                    for record in response['Records']:
+                        try:
+                            data = json.loads(record['Data'].decode('utf-8'))
+                            # Update the latest stocks queue
+                            if latest_stocks.full():
+                                latest_stocks.get()  # Remove oldest item if queue is full
+                            latest_stocks.put(data)
+                            logger.debug(f"Processed record: {data}")
+                            # Save data to DynamoDB
+                            db_manager.save_price(data)
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Error decoding JSON: {e}")
+                        except Exception as e:
+                            logger.error(f"Error processing record: {e}")
+                    
+                    # Update shard iterator
+                    shard_iterator = response['NextShardIterator']
+                    
+                    # Add a small delay to avoid excessive API calls
+                    time.sleep(1)
+                    
+                except Exception as e:
+                    logger.error(f"Error getting records: {e}")
+                    time.sleep(5)  # Wait before retrying
+                    
         except Exception as e:
-            logger.error(f"Error in Kafka consumer: {e}")
-        finally:
-            consumer.close()
+            logger.error(f"Error in Kinesis listener: {e}")
 
 @app.route('/api/stocks', methods=['GET'])
 def get_stocks():
@@ -141,20 +152,17 @@ def get_stock_history():
 def health_check():
     return jsonify({
         'status': 'healthy',
-        'kafka_queue_size': latest_stocks.qsize()
+        'kinesis_queue_size': latest_stocks.qsize()
     })
 
 def start_app():
-    try:
-        # Start Kafka listener thread
-        kafka_listener = KafkaListener()
-        kafka_listener.start()
-        
-        # Start Flask app
-        app.run(host='0.0.0.0', port=5002, debug=False)
-    except Exception as e:
-        logger.error(f"Error starting application: {e}")
-        raise
+    # Start Kinesis listener thread
+    listener = KinesisListener()
+    listener.start()
+    logger.info("Started Kinesis listener thread")
+    
+    # Start Flask app
+    app.run(host='0.0.0.0', port=5000)
 
 if __name__ == '__main__':
     start_app()
